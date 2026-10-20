@@ -1,12 +1,13 @@
 import { frameContextPoint, type ContextPoint } from './contextPosition';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
-import type { OverlayInfo, RectMap, SpacingMap } from './PreviewOverlays';
+import type { CanvasFeedback, OverlayInfo, RectMap, SpacingMap } from './PreviewOverlays';
 import type { PreviewDevice } from './PreviewToolbar';
 import type { PreviewMessage, PreviewReloadReason } from './previewMessages';
 import type { GuideMetrics } from './guideModel';
 import { parsePreviewMessage } from './previewMessages';
 import { outlineBoxPath, sameCopy } from './outlineBoxes';
+import { useFeedbackReveal } from './feedbackReveal';
 import { setModifiers } from '../../editor/heldModifiers';
 import { noteCanvasReady, receiveCanvasReply, setCanvasFrame } from '../../editor/canvasQuery';
 import type { Digest } from '../../../shared/core/brand';
@@ -30,6 +31,9 @@ export interface PreviewRuntimeProps {
   readonly navigatorSelectionTick?: number;
   readonly navHoverPath?: string | undefined;
   readonly overlayInfo?: ((path: string) => OverlayInfo | undefined) | undefined;
+  /** The Feedback tab is open: clicks annotate, and the pins and the note box
+   * are measured (the frame measures only what it tracks). */
+  readonly feedback?: CanvasFeedback | undefined;
   readonly focusPath?: string | undefined;
   readonly focusOcc?: number | undefined;
   readonly pathScope?: string;
@@ -110,10 +114,7 @@ export function usePreviewRuntime(
   useMessageListener(iframeRef, refs, setters);
   // The frame measures only tracked paths, so both hover sources must use
   // the same active path for measurement requests and outline rendering.
-  const trackPaths = useMemo(
-    () => trackedPaths(props.selPath, hoverPath, props.focusPath, selectedBoxPath, hoverBoxPath),
-    [props.focusPath, hoverPath, hoverBoxPath, props.selPath, selectedBoxPath],
-  );
+  const trackPaths = useTrackPaths(props, [hoverPath, selectedBoxPath, hoverBoxPath]);
   const link = useFrameLink(iframeRef);
   const registerFrame = useCallback((): void => {
     const frame = iframeRef.current?.contentWindow;
@@ -123,6 +124,9 @@ export function usePreviewRuntime(
     frame?.postMessage({ type: 'avb:request-render' }, '*');
     link.notify();
   }, [link]);
+  // A flag, not the object: the object is new every render, and re-tracking
+  // makes the frame report rects, which renders again.
+  const annotating = props.feedback !== undefined;
   const sendTrack = useCallback((): void => {
     link.post({
       type: 'avb:track',
@@ -130,11 +134,13 @@ export function usePreviewRuntime(
       scope: props.pathScope ?? '',
       focus: props.focusPath ?? '',
       focusOcc: props.focusOcc ?? 0,
+      annotate: annotating,
     });
-  }, [link, props.focusOcc, props.focusPath, props.pathScope, trackPaths]);
+  }, [annotating, link, props.focusOcc, props.focusPath, props.pathScope, trackPaths]);
   useFrameRegistration(props, url, registerFrame, sendTrack);
   useSelectionScroll(props, iframeRef, refs);
   useResetOnReload(props, url, refs, setters);
+  useFeedbackReveal(props.feedback, rects, url, link.post);
   return {
     iframeRef,
     rects,
@@ -318,16 +324,16 @@ function applyMessage(
       setModifiers({ shiftKey: message.shiftKey, altKey: message.altKey });
       break;
     case 'hover-node':
-      // A picture, not a selection: only the rendering has to be the latest.
-      if (judgeEventToken(message.token, refs.render.current).tag === 'current') {
-        setters.setCanvasHover(message.path);
-        setters.setHoverOcc(message.occurrence);
-      } else {
-        setters.setCanvasHover(undefined);
-      }
+      applyHover(message, refs, setters);
       break;
     case 'context-node':
       applyContextMenu(message, refs, setters, frame);
+      break;
+    case 'annotate-node':
+      // A note's trail is read from the files: the rendering has to be them.
+      gateEvent(message.token, refs, { kind: 'open' }, () =>
+        refs.props.current.feedback?.onAnnotate(message),
+      );
       break;
     case 'click-node':
       gateEvent(
@@ -358,6 +364,20 @@ function applyMessage(
         refs.props.current.onOpenPath?.(message.path ?? undefined, message.occurrence),
       );
       break;
+  }
+}
+
+// A picture, not a selection: only the rendering has to be the latest.
+function applyHover(
+  message: Extract<PreviewMessage, { readonly kind: 'hover-node' }>,
+  refs: RuntimeRefs,
+  setters: RuntimeSetters,
+): void {
+  if (judgeEventToken(message.token, refs.render.current).tag === 'current') {
+    setters.setCanvasHover(message.path);
+    setters.setHoverOcc(message.occurrence);
+  } else {
+    setters.setCanvasHover(undefined);
   }
 }
 
@@ -534,6 +554,31 @@ function useResetOnReload(
     lastClickRef.current = undefined;
     announceRender(refs.render, undefined); // A reloaded frame announces its rendering again.
   }, [canvasMode, props.refreshKey, refs, setters, url]);
+}
+
+// The paths the frame measures: the selection, the hover, the focus, their
+// outline boxes, and the Feedback pins.
+function useTrackPaths(
+  props: PreviewRuntimeProps,
+  [hoverPath, selectedBoxPath, hoverBoxPath]: readonly (string | undefined)[],
+): readonly string[] {
+  const { feedback } = props;
+  const pinPaths = [...(feedback?.pins ?? []), ...(feedback?.composer ? [feedback.composer] : [])]
+    .map((pin) => pin.path)
+    .join('\n');
+  const { focusPath, selPath: selectionPath } = props;
+  return useMemo(
+    () =>
+      trackedPaths(
+        selectionPath,
+        hoverPath,
+        focusPath,
+        selectedBoxPath,
+        hoverBoxPath,
+        ...pinPaths.split('\n'),
+      ),
+    [focusPath, hoverPath, hoverBoxPath, selectionPath, selectedBoxPath, pinPaths],
+  );
 }
 
 function trackedPaths(...paths: readonly (string | undefined)[]): readonly string[] {
